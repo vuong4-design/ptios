@@ -448,7 +448,7 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
                 NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
                 while ([task isRunning]) {
                     if ([[NSDate date] compare:deadline] != NSOrderedAscending) {
-                        timedOut = YES;
+                        timedOut = true;
                         break;
                     }
                     usleep(20 * 1000); // 20 ms poll
