@@ -1,5 +1,12 @@
 #include "Task.h"
 #import <Foundation/Foundation.h>
+#ifndef YES
+#define YES true
+#endif
+#ifndef NO
+#define NO false
+#endif
+
 #include <spawn.h>
 #include <poll.h>
 #include "Touch.h"
