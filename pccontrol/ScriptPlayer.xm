@@ -331,9 +331,9 @@ static NSString *tlinkautoStringValue(id value) {
     _state = TLinkScriptStateRunning;
     os_unfair_lock_unlock(&_playerLock);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self->switchAppBeforePlaying) bringAppForeground(foregroundApp);
-    });
+    if (self->switchAppBeforePlaying) {
+        bringAppForeground(foregroundApp);
+    }
 
     NSError *runError = nil;
     JS_DIAG("P5", "before runScriptAtPath");
