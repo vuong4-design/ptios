@@ -210,7 +210,7 @@ static NSString *tlinkautoStringValue(id value) {
         os_unfair_lock_unlock(&_playerLock);
 
         dispatch_async(_jsSerialQueue, ^{
-            [self executeJSIteration:session filePath:entryFilePath foregroundApp:foregroundApp requestAt:requestAt];
+            [self executeJSIteration:session filePath:entryFilePath foregroundApp:foregroundApp];
         });
         return 0;
     } else if ([runtime isEqualToString:@"python"] || [fileExtension isEqualToString:@"py"]) {
@@ -304,7 +304,7 @@ static NSString *tlinkautoStringValue(id value) {
     [self playHasStopped];
 }
 
-- (void)executeJSIteration:(TLinkScriptSession *)session filePath:(NSString *)filePath foregroundApp:(NSString *)foregroundApp requestAt:(CFAbsoluteTime)requestAt {
+- (void)executeJSIteration:(TLinkScriptSession *)session filePath:(NSString *)filePath foregroundApp:(NSString *)foregroundApp {
     os_unfair_lock_lock(&_playerLock);
     if (_currentSession != session || [session.cancellationToken isCancelled]) {
         os_unfair_lock_unlock(&_playerLock);
@@ -341,7 +341,7 @@ static NSString *tlinkautoStringValue(id value) {
             self->circleView.backgroundColor = [UIColor orangeColor];
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)), _jsSerialQueue, ^{
-            [self executeJSIteration:session filePath:filePath foregroundApp:foregroundApp requestAt:CFAbsoluteTimeGetCurrent()];
+            [self executeJSIteration:session filePath:filePath foregroundApp:foregroundApp];
         });
     } else {
         os_unfair_lock_unlock(&_playerLock);
