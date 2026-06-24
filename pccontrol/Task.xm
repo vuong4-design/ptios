@@ -216,7 +216,7 @@ typedef struct {
 // Drain one file handle to EOF. CRITICAL (A2): once the shared budget is exhausted
 // we KEEP reading and discard, so the pipe never fills and the child never blocks.
 // Stopping early would reintroduce the original deadlock.
-static void ZXDrainShellHandle(NSFileHandle *handle, NSMutableData *outBuffer, ZXShellBudget *budget, BOOL *outTruncated)
+static void ZXDrainShellHandle(NSFileHandle *handle, NSMutableData *outBuffer, ZXShellBudget *budget, bool *outTruncated)
 {
     if (!handle) return;
     while (true) {
@@ -245,7 +245,7 @@ static void ZXDrainShellHandle(NSFileHandle *handle, NSMutableData *outBuffer, Z
                 [outBuffer appendBytes:chunk.bytes length:accepted];
             }
             if (accepted < (NSUInteger)chunk.length && outTruncated) {
-                *outTruncated = YES;
+                *outTruncated = true;
             }
             // else: budget full -> keep looping, read+discard until EOF.
         }
@@ -413,8 +413,8 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
 
             NSMutableData *outData = [NSMutableData data];
             NSMutableData *errData = [NSMutableData data];
-            __block BOOL outTruncated = NO;
-            __block BOOL errTruncated = NO;
+            __block bool outTruncated = false;
+            __block bool errTruncated = false;
             ZXShellBudget budget;
             budget.lock = OS_UNFAIR_LOCK_INIT;
             budget.capturedBytes = 0;
@@ -434,15 +434,15 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
                 ZXDrainShellHandle(errHandle, errData, budgetPtr, &errTruncated);
             });
 
-            BOOL launched = NO;
+            bool launched = false;
             @try {
                 [task launch];
-                launched = YES;
+                launched = true;
             } @catch (NSException *e) {
                 NSLog(@"com.tlinkauto.springboard: runShell launch failed: %@", e.reason);
             }
 
-            BOOL timedOut = NO;
+            bool timedOut = false;
             if (launched) {
                 // A4: bounded wait instead of waitUntilExit. Poll termination with a deadline.
                 NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
@@ -479,7 +479,7 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
             NSString *errStr = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
             NSString *combined = errStr.length > 0 ? [outStr stringByAppendingString:errStr] : outStr;
             NSString *safeOutput = [[combined stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"] stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
-            BOOL truncated = outTruncated || errTruncated;
+            bool truncated = outTruncated || errTruncated;
             if (truncated) {
                 safeOutput = [safeOutput stringByAppendingFormat:@"\\n[output truncated: exceeded %lu bytes]", (unsigned long)kShellMaxCapturedOutputBytes];
             }
