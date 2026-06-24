@@ -1,4 +1,5 @@
 #import "ScriptPlayer.h"
+#import "TLinkDiagnostic.h"
 #include "Play.h"
 #include "SocketServer.h"
 #include "Process.h"
@@ -177,6 +178,9 @@ static NSString *tlinkautoStringValue(id value) {
         }); 
         return 0;
     } else if ([runtime isEqualToString:@"javascriptcore"] || [fileExtension isEqualToString:@"js"]) {
+        CFAbsoluteTime requestAt = CFAbsoluteTimeGetCurrent();
+        JS_DIAG("P0", "play requested");
+        
         if (!tlinkautoJavaScriptRuntimeEnabled()) {
             if (error) *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;JavaScriptCore runtime is disabled.\r\n"}];
             [self clear];
@@ -208,7 +212,7 @@ static NSString *tlinkautoStringValue(id value) {
         os_unfair_lock_unlock(&_playerLock);
 
         dispatch_async(_jsSerialQueue, ^{
-            [self executeJSIteration:session filePath:entryFilePath foregroundApp:foregroundApp];
+            [self executeJSIteration:session filePath:entryFilePath foregroundApp:foregroundApp requestAt:requestAt];
         });
         return 0;
     } else if ([runtime isEqualToString:@"python"] || [fileExtension isEqualToString:@"py"]) {
@@ -301,13 +305,16 @@ static NSString *tlinkautoStringValue(id value) {
     [self playHasStopped];
 }
 
-- (void)executeJSIteration:(TLinkScriptSession *)session filePath:(NSString *)filePath foregroundApp:(NSString *)foregroundApp {
+- (void)executeJSIteration:(TLinkScriptSession *)session filePath:(NSString *)filePath foregroundApp:(NSString *)foregroundApp requestAt:(CFAbsoluteTime)requestAt {
+    JS_DIAG("P2", "entered js queue, wait=%.2fms", (CFAbsoluteTimeGetCurrent() - requestAt) * 1000.0);
+    
     os_unfair_lock_lock(&_playerLock);
     if (_currentSession != session || [session.cancellationToken isCancelled]) {
         os_unfair_lock_unlock(&_playerLock);
         return;
     }
     TLinkautoJSRuntime *runtime = [[TLinkautoJSRuntime alloc] init];
+    JS_DIAG("P4", "runtime allocated, total=%.2fms", (CFAbsoluteTimeGetCurrent() - requestAt) * 1000.0);
     _currentRuntime = runtime;
     _state = TLinkScriptStateRunning;
     os_unfair_lock_unlock(&_playerLock);
@@ -317,7 +324,9 @@ static NSString *tlinkautoStringValue(id value) {
     });
 
     NSError *runError = nil;
+    JS_DIAG("P5", "before runScriptAtPath");
     BOOL ok = [runtime runScriptAtPath:filePath bundlePath:scriptBundlePath manifest:currentManifest context:session.taskContext error:&runError];
+    JS_DIAG("P6", "runScript returned success=%d total=%.2fms", ok, (CFAbsoluteTimeGetCurrent() - requestAt) * 1000.0);
     
     os_unfair_lock_lock(&_playerLock);
     if (_currentSession != session) {
@@ -338,7 +347,7 @@ static NSString *tlinkautoStringValue(id value) {
             self->circleView.backgroundColor = [UIColor orangeColor];
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)), _jsSerialQueue, ^{
-            [self executeJSIteration:session filePath:filePath foregroundApp:foregroundApp];
+            [self executeJSIteration:session filePath:filePath foregroundApp:foregroundApp requestAt:CFAbsoluteTimeGetCurrent()];
         });
     } else {
         os_unfair_lock_unlock(&_playerLock);
