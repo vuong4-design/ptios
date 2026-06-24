@@ -418,16 +418,20 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
             ZXShellBudget budget;
             budget.lock = OS_UNFAIR_LOCK_INIT;
             budget.capturedBytes = 0;
+            ZXShellBudget *budgetPtr = &budget;
 
             dispatch_queue_t ioQueue = dispatch_queue_create("com.tlinkauto.shell.io", DISPATCH_QUEUE_CONCURRENT);
             dispatch_group_t drainGroup = dispatch_group_create();
 
             // A1: start readers BEFORE launch so the pipe is always being drained.
+            // Capture budgetPtr (a pointer) rather than the struct: blocks capture
+            // automatic variables as const-by-value, which would make &budget a
+            // const pointer. budget lives on the stack until dispatch_group_wait below.
             dispatch_group_async(drainGroup, ioQueue, ^{
-                ZXDrainShellHandle(outHandle, outData, &budget, &outTruncated);
+                ZXDrainShellHandle(outHandle, outData, budgetPtr, &outTruncated);
             });
             dispatch_group_async(drainGroup, ioQueue, ^{
-                ZXDrainShellHandle(errHandle, errData, &budget, &errTruncated);
+                ZXDrainShellHandle(errHandle, errData, budgetPtr, &errTruncated);
             });
 
             BOOL launched = NO;
