@@ -18,6 +18,11 @@
 - (void)awakeFromNib {
     [super awakeFromNib];
     // Initialization code
+    [_playButton addTarget:self action:@selector(playTouchDown:) forControlEvents:UIControlEventTouchDown];
+}
+
+- (void)playTouchDown:(UIButton *)sender {
+    APP_DIAG("UI-DOWN", "play touch down path=%s", filePath.UTF8String ?: "(null)");
 }
 
 - (IBAction)playButtonClick:(id)sender {
