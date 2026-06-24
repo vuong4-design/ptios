@@ -214,6 +214,7 @@ static const double kShellTerminateGrace = 1.5;
 @interface TLinkShellDrainContext : NSObject {
 @private
     os_unfair_lock _lock;
+    BOOL _forceCloseReaders;
 }
 @property (nonatomic, strong) NSMutableData *outData;
 @property (nonatomic, strong) NSMutableData *errData;
@@ -221,6 +222,8 @@ static const double kShellTerminateGrace = 1.5;
 @property (nonatomic, assign) BOOL outTruncated;
 @property (nonatomic, assign) BOOL errTruncated;
 - (void)appendChunk:(NSData *)chunk toStderr:(BOOL)isStderr;
+- (void)requestForceCloseReaders;
+- (BOOL)shouldForceCloseReaders;
 @end
 
 @implementation TLinkShellDrainContext
@@ -228,10 +231,22 @@ static const double kShellTerminateGrace = 1.5;
     self = [super init];
     if (self) {
         _lock = OS_UNFAIR_LOCK_INIT;
+        _forceCloseReaders = false;
         _outData = [NSMutableData data];
         _errData = [NSMutableData data];
     }
     return self;
+}
+- (void)requestForceCloseReaders {
+    os_unfair_lock_lock(&_lock);
+    _forceCloseReaders = true;
+    os_unfair_lock_unlock(&_lock);
+}
+- (BOOL)shouldForceCloseReaders {
+    os_unfair_lock_lock(&_lock);
+    BOOL value = _forceCloseReaders;
+    os_unfair_lock_unlock(&_lock);
+    return value;
 }
 - (void)appendChunk:(NSData *)chunk toStderr:(BOOL)isStderr {
     if (!chunk || chunk.length == 0) return;
@@ -247,8 +262,8 @@ static const double kShellTerminateGrace = 1.5;
         }
     }
     if (accepted < chunk.length) {
-        if (isStderr) self.errTruncated = YES;
-        else self.outTruncated = YES;
+        if (isStderr) self.errTruncated = true;
+        else self.outTruncated = true;
     }
     os_unfair_lock_unlock(&_lock);
 }
@@ -323,15 +338,13 @@ static TLinkShellResult *RunShellCore(NSString *command, TLinkTaskExecutionConte
     }
 
     TLinkShellDrainContext *drainCtx = [[TLinkShellDrainContext alloc] init];
-    __block BOOL forceCloseReaders = NO;
 
     dispatch_queue_t ioQueue = dispatch_queue_create("com.tlinkauto.shell.io", DISPATCH_QUEUE_CONCURRENT);
     dispatch_group_t drainGroup = dispatch_group_create();
 
     void (^drainBlock)(int, BOOL) = ^(int fd, BOOL isStderr) {
         fcntl(fd, F_SETFL, O_NONBLOCK);
-        while (true) {
-            if (forceCloseReaders) break;
+        while (![drainCtx shouldForceCloseReaders]) {
             struct pollfd pfd = { fd, POLLIN, 0 };
             int ret = poll(&pfd, 1, 100);
             if (ret > 0) {
@@ -356,12 +369,12 @@ static TLinkShellResult *RunShellCore(NSString *command, TLinkTaskExecutionConte
 
     int outFd = outPipe[0];
     int errFd = errPipe[0];
-    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(outFd, NO); });
-    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(errFd, YES); });
+    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(outFd, false); });
+    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(errFd, true); });
 
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:actualTimeout];
-    BOOL timedOut = NO;
-    BOOL cancelled = NO;
+    BOOL timedOut = false;
+    BOOL cancelled = false;
 
     while (true) {
         int status;
@@ -377,11 +390,11 @@ static TLinkShellResult *RunShellCore(NSString *command, TLinkTaskExecutionConte
         }
 
         if ([[NSDate date] compare:deadline] != NSOrderedAscending) {
-            timedOut = YES;
+            timedOut = true;
             break;
         }
         if (context && context.cancellationToken && [context.cancellationToken isCancelled]) {
-            cancelled = YES;
+            cancelled = true;
             break;
         }
         usleep(20 * 1000);
@@ -418,8 +431,8 @@ static TLinkShellResult *RunShellCore(NSString *command, TLinkTaskExecutionConte
         NSDate *drainDeadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
         while (dispatch_group_wait(drainGroup, DISPATCH_TIME_NOW) != 0) {
             if ([[NSDate date] compare:drainDeadline] != NSOrderedAscending) {
-                forceCloseReaders = YES;
-                result.drainForcedClosed = YES;
+                [drainCtx requestForceCloseReaders];
+                result.drainForcedClosed = true;
                 break;
             }
             usleep(20 * 1000);
@@ -650,8 +663,8 @@ void processTaskWithContext(UInt8 *buff, size_t actualLength, CFWriteStreamRef w
             if (respData.length > kTLinkautoJSMaxResponseBytes) {
                 resp[@"stdout"] = @"[Truncated due to JSON size limit]";
                 resp[@"stderr"] = @"[Truncated due to JSON size limit]";
-                resp[@"stdoutTruncated"] = @(YES);
-                resp[@"stderrTruncated"] = @(YES);
+                resp[@"stdoutTruncated"] = @(true);
+                resp[@"stderrTruncated"] = @(true);
                 respData = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
             }
             
