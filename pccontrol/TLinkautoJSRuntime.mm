@@ -193,6 +193,13 @@ struct TLinkautoJSWatchdogProbeState {
     TLinkautoJSSetExecutionTimeLimitFn _setExecutionTimeLimit;
     TLinkautoJSClearExecutionTimeLimitFn _clearExecutionTimeLimit;
     BOOL _watchdogAvailable;
+    
+    dispatch_queue_t _logQueue;
+    os_unfair_lock _logStateLock;
+    BOOL _acceptingLogs;
+    
+    os_unfair_lock _handlesLock;
+    BOOL _acceptingHandles;
 }
 - (BOOL)watchdogAvailable;
 - (NSString *)currentBundlePath;
@@ -510,6 +517,13 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
         _setExecutionTimeLimit = (TLinkautoJSSetExecutionTimeLimitFn)dlsym(RTLD_DEFAULT, "JSContextGroupSetExecutionTimeLimit");
         _clearExecutionTimeLimit = (TLinkautoJSClearExecutionTimeLimitFn)dlsym(RTLD_DEFAULT, "JSContextGroupClearExecutionTimeLimit");
         _watchdogAvailable = TLinkautoJSWatchdogCapability(_setExecutionTimeLimit, _clearExecutionTimeLimit);
+        
+        _logQueue = dispatch_queue_create("com.tlinkauto.js.log", DISPATCH_QUEUE_SERIAL);
+        _logStateLock = OS_UNFAIR_LOCK_INIT;
+        _acceptingLogs = NO;
+        
+        _handlesLock = OS_UNFAIR_LOCK_INIT;
+        _acceptingHandles = NO;
     }
     return self;
 }
@@ -588,46 +602,80 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
 
 - (void)appendConsoleLogWithLevel:(NSString *)level message:(NSString *)message
 {
+    os_unfair_lock_lock(&_logStateLock);
+    if (!_acceptingLogs) {
+        os_unfair_lock_unlock(&_logStateLock);
+        return;
+    }
+    os_unfair_lock_unlock(&_logStateLock);
+
     NSString *safeLevel = TLinkautoJSSanitizeFileComponent(level ?: @"log");
     NSString *safeMessage = [message isKindOfClass:[NSString class]] ? message : [message description];
     safeMessage = safeMessage ?: @"";
     safeMessage = [safeMessage stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
     NSString *line = [NSString stringWithFormat:@"[%@][%@][%@] %@\n", [[NSDate date] description], _runId ?: @"", safeLevel, safeMessage];
-    [self appendLine:line toConsolePath:_consoleLogPath];
-    [self appendLine:line toConsolePath:_consoleLatestLogPath];
+    
+    NSString *path1 = _consoleLogPath;
+    NSString *path2 = _consoleLatestLogPath;
+    
+    dispatch_async(_logQueue, ^{
+        [self appendLine:line toConsolePath:path1];
+        [self appendLine:line toConsolePath:path2];
+    });
 }
 
 - (void)trackFrameId:(int)frameId
 {
-    if (frameId > 0) [_ownedFrameIds addObject:@(frameId)];
+    if (frameId > 0) {
+        os_unfair_lock_lock(&_handlesLock);
+        if (_acceptingHandles) [_ownedFrameIds addObject:@(frameId)];
+        os_unfair_lock_unlock(&_handlesLock);
+    }
 }
 
 - (void)untrackFrameId:(int)frameId
 {
-    if (frameId > 0) [_ownedFrameIds removeObject:@(frameId)];
+    if (frameId > 0) {
+        os_unfair_lock_lock(&_handlesLock);
+        [_ownedFrameIds removeObject:@(frameId)];
+        os_unfair_lock_unlock(&_handlesLock);
+    }
 }
 
 - (void)untrackAllFrameIds
 {
+    os_unfair_lock_lock(&_handlesLock);
     [_ownedFrameIds removeAllObjects];
+    os_unfair_lock_unlock(&_handlesLock);
 }
 
 - (void)trackImageId:(int)imageId
 {
-    if (imageId > 0) [_ownedImageIds addObject:@(imageId)];
+    if (imageId > 0) {
+        os_unfair_lock_lock(&_handlesLock);
+        if (_acceptingHandles) [_ownedImageIds addObject:@(imageId)];
+        os_unfair_lock_unlock(&_handlesLock);
+    }
 }
 
 - (void)untrackImageId:(int)imageId
 {
-    if (imageId > 0) [_ownedImageIds removeObject:@(imageId)];
+    if (imageId > 0) {
+        os_unfair_lock_lock(&_handlesLock);
+        [_ownedImageIds removeObject:@(imageId)];
+        os_unfair_lock_unlock(&_handlesLock);
+    }
 }
 
 - (void)releaseOwnedHandles
 {
+    os_unfair_lock_lock(&_handlesLock);
+    _acceptingHandles = NO;
     NSArray<NSNumber *> *frameIds = [_ownedFrameIds allObjects];
     NSArray<NSNumber *> *imageIds = [_ownedImageIds allObjects];
     [_ownedFrameIds removeAllObjects];
     [_ownedImageIds removeAllObjects];
+    os_unfair_lock_unlock(&_handlesLock);
 
     bool wasAborted = _cancelState->aborted.load(std::memory_order_acquire);
     _cancelState->aborted.store(false, std::memory_order_release);
@@ -831,7 +879,7 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     _clearExecutionTimeLimit(group);
 }
 
-- (BOOL)runScriptAtPath:(NSString *)scriptPath bundlePath:(NSString *)bundlePath manifest:(NSDictionary *)manifest error:(NSError **)error
+- (BOOL)runScriptAtPath:(NSString *)scriptPath bundlePath:(NSString *)bundlePath manifest:(NSDictionary *)manifest context:(TLinkTaskExecutionContext *)context error:(NSError **)error
 {
     if (_running) {
         if (error) *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;JavaScript runtime is busy.\r\n"}];
@@ -848,11 +896,25 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     _bundlePath = [bundlePath copy];
     _manifest = [manifest isKindOfClass:[NSDictionary class]] ? [manifest copy] : @{};
     [self prepareConsoleLogFiles];
+    
+    os_unfair_lock_lock(&_logStateLock);
+    _acceptingLogs = YES;
+    os_unfair_lock_unlock(&_logStateLock);
+    
+    os_unfair_lock_lock(&_handlesLock);
+    _acceptingHandles = YES;
+    os_unfair_lock_unlock(&_handlesLock);
+    
     _cancelState->aborted.store(false, std::memory_order_release);
+    
+    @try {
 
+    NSLog(@"[Diag-E1] Init JSVM start");
     JSVirtualMachine *vm = [[JSVirtualMachine alloc] init];
+    NSLog(@"[Diag-E2] Init JSVM done, Init JSContext start");
     JSContext *context = [[JSContext alloc] initWithVirtualMachine:vm];
     _context = context;
+    NSLog(@"[Diag-E3] Init JSContext done");
 
     __weak TLinkautoJSRuntime *weakSelf = self;
     context.exceptionHandler = ^(JSContext *ctx, JSValue *exception) {
@@ -1034,27 +1096,37 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
          "})();";
 
     [self installWatchdogForContext:context];
+    NSLog(@"[Diag-E4] Evaluating prelude");
     [context evaluateScript:consolePrelude withSourceURL:[NSURL URLWithString:@"tlinkauto://console-prelude.js"]];
     [context evaluateScript:modulePrelude withSourceURL:[NSURL URLWithString:@"tlinkauto://module-prelude.js"]];
     [context evaluateScript:helperPrelude withSourceURL:[NSURL URLWithString:@"tlinkauto://helper-prelude.js"]];
     NSURL *sourceURL = [NSURL fileURLWithPath:scriptPath ?: @"script.js"];
+    NSLog(@"[Diag-E5] Evaluating main script");
     [context evaluateScript:script withSourceURL:sourceURL];
-    [self clearWatchdogForContext:context];
-
+    NSLog(@"[Diag-E6] Script evaluation finished");
     BOOL success = !context.exception && ![self isAborted];
     if (!success && error) {
         NSString *message = context.exception ? [context.exception toString] : @"JavaScript execution was stopped";
         *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"-1;;%@\r\n", message ?: @"JavaScript error"]}];
     }
-
-    [self releaseOwnedHandles];
-    _context = nil;
-    _bundlePath = nil;
-    _manifest = nil;
-    _consoleLogPath = nil;
-    _consoleLatestLogPath = nil;
-    _running = NO;
     return success;
+    } @finally {
+        NSLog(@"[Diag-E8] Teardown start");
+        [self releaseOwnedHandles];
+        [self clearWatchdogForContext:_context];
+        _context = nil;
+        _bundlePath = nil;
+        _manifest = nil;
+        
+        os_unfair_lock_lock(&_logStateLock);
+        _acceptingLogs = NO;
+        os_unfair_lock_unlock(&_logStateLock);
+        dispatch_sync(_logQueue, ^{}); // flush
+        
+        _consoleLogPath = nil;
+        _consoleLatestLogPath = nil;
+        _running = NO;
+    }
 }
 
 @end
@@ -1553,6 +1625,10 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
 
 - (NSDictionary *)ocrFrame:(int)frameId options:(NSDictionary *)options
 {
+    if ([self.runtime isAborted]) {
+        [self.runtime throwError:@"JavaScript execution was aborted"];
+        return @{ @"ok": @NO };
+    }
     if (frameId <= 0) {
         [self.runtime throwError:@"ocrFrame(frameId, options) requires a positive frame id"];
         return @{ @"ok": @NO };

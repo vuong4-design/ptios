@@ -192,74 +192,265 @@ static bool zx_handleNativeBatch(UInt8 *eventData, NSError **err)
 }
 
 // === runShell drain/timeout support (Group A) ===
-//
-// Technical note (A7): the cancellation path below sends SIGTERM/SIGKILL to the
-// DIRECT child only (the /usr/bin/sudo process launched by NSTask). If the shell
-// spawns its own descendants, those are NOT guaranteed to be reaped or to close
-// the pipe. Reliable hard-cancellation of a whole process tree requires launching
-// in a dedicated process group (e.g. posix_spawn + setpgid, then killpg). That is
-// deferred to a later phase and tracked in the plan.
 
-static const NSUInteger kShellMaxCapturedOutputBytes = 1024 * 1024; // 1 MiB total (stdout+stderr)
-static const NSUInteger kShellReadChunkBytes = 16 * 1024;          // 16 KiB
+static const NSUInteger kShellMaxCapturedOutputBytes = 768 * 1024;
+static const NSUInteger kTLinkautoJSMaxResponseBytes = 1024 * 1024;
+static const NSUInteger kShellReadChunkBytes = 16 * 1024;
 static const double kShellDefaultTimeout = 30.0;
 static const double kShellMinTimeout = 1.0;
 static const double kShellMaxTimeout = 300.0;
 static const double kShellTerminateGrace = 1.5;
 
-// Shared capture budget for both readers. capturedBytes/flags are guarded by lock.
-typedef struct {
-    os_unfair_lock lock;
-    NSUInteger capturedBytes;
-} ZXShellBudget;
+@interface TLinkShellDrainContext : NSObject {
+@private
+    os_unfair_lock _lock;
+}
+@property (nonatomic, strong) NSMutableData *outData;
+@property (nonatomic, strong) NSMutableData *errData;
+@property (nonatomic, assign) NSUInteger capturedBytes;
+@property (nonatomic, assign) BOOL outTruncated;
+@property (nonatomic, assign) BOOL errTruncated;
+- (void)appendChunk:(NSData *)chunk toStderr:(BOOL)isStderr;
+@end
 
-// Drain one file handle to EOF. CRITICAL (A2): once the shared budget is exhausted
-// we KEEP reading and discard, so the pipe never fills and the child never blocks.
-// Stopping early would reintroduce the original deadlock.
-static void ZXDrainShellHandle(NSFileHandle *handle, NSMutableData *outBuffer, ZXShellBudget *budget, bool *outTruncated)
-{
-    if (!handle) return;
-    while (true) {
-        @autoreleasepool {
-            NSData *chunk = nil;
-            @try {
-                chunk = [handle readDataOfLength:kShellReadChunkBytes];
-            } @catch (NSException *e) {
-                // Handle closed underneath us (timeout cleanup). Stop draining.
-                break;
-            }
-            if (chunk.length == 0) {
-                break; // EOF
-            }
-            os_unfair_lock_lock(&budget->lock);
-            NSUInteger remaining = (budget->capturedBytes >= kShellMaxCapturedOutputBytes)
-                ? 0
-                : (kShellMaxCapturedOutputBytes - budget->capturedBytes);
-            NSUInteger accepted = MIN(remaining, (NSUInteger)chunk.length);
-            if (accepted > 0) {
-                budget->capturedBytes += accepted;
-            }
-            os_unfair_lock_unlock(&budget->lock);
-
-            if (accepted > 0) {
-                [outBuffer appendBytes:chunk.bytes length:accepted];
-            }
-            if (accepted < (NSUInteger)chunk.length && outTruncated) {
-                *outTruncated = true;
-            }
-            // else: budget full -> keep looping, read+discard until EOF.
+@implementation TLinkShellDrainContext
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _lock = OS_UNFAIR_LOCK_INIT;
+        _outData = [NSMutableData data];
+        _errData = [NSMutableData data];
+    }
+    return self;
+}
+- (void)appendChunk:(NSData *)chunk toStderr:(BOOL)isStderr {
+    if (!chunk || chunk.length == 0) return;
+    os_unfair_lock_lock(&_lock);
+    NSUInteger remaining = (self.capturedBytes >= kShellMaxCapturedOutputBytes) ? 0 : (kShellMaxCapturedOutputBytes - self.capturedBytes);
+    NSUInteger accepted = MIN(remaining, chunk.length);
+    if (accepted > 0) {
+        self.capturedBytes += accepted;
+        if (isStderr) {
+            [self.errData appendBytes:chunk.bytes length:accepted];
+        } else {
+            [self.outData appendBytes:chunk.bytes length:accepted];
         }
     }
+    if (accepted < chunk.length) {
+        if (isStderr) self.errTruncated = YES;
+        else self.outTruncated = YES;
+    }
+    os_unfair_lock_unlock(&_lock);
+}
+@end
+
+@interface TLinkShellResult : NSObject
+@property (nonatomic, assign) int exitCode;
+@property (nonatomic, assign) int terminationSignal;
+@property (nonatomic, assign) BOOL timedOut;
+@property (nonatomic, assign) BOOL cancelled;
+@property (nonatomic, assign) BOOL drainForcedClosed;
+@property (nonatomic, strong) NSString *stdoutStr;
+@property (nonatomic, strong) NSString *stderrStr;
+@property (nonatomic, assign) BOOL stdoutTruncated;
+@property (nonatomic, assign) BOOL stderrTruncated;
+@end
+
+@implementation TLinkShellResult
+@end
+
+static TLinkShellResult *RunShellCore(NSString *command, TLinkTaskExecutionContext *context, double timeoutSeconds, NSUInteger maxOutputBytes) {
+    TLinkShellResult *result = [[TLinkShellResult alloc] init];
+    result.exitCode = -1;
+    result.stdoutStr = @"";
+    result.stderrStr = @"";
+
+    double actualTimeout = timeoutSeconds;
+    if (actualTimeout <= 0) actualTimeout = (context && context.defaultTimeoutSeconds > 0) ? context.defaultTimeoutSeconds : kShellDefaultTimeout;
+    if (actualTimeout < kShellMinTimeout) actualTimeout = kShellMinTimeout;
+    if (actualTimeout > kShellMaxTimeout) actualTimeout = kShellMaxTimeout;
+
+    int outPipe[2] = {-1, -1};
+    int errPipe[2] = {-1, -1};
+    
+    if (pipe(outPipe) != 0 || pipe(errPipe) != 0) {
+        result.stderrStr = @"Failed to create pipes";
+        return result;
+    }
+    
+    fcntl(outPipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(outPipe[1], F_SETFD, FD_CLOEXEC);
+    fcntl(errPipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(errPipe[1], F_SETFD, FD_CLOEXEC);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, outPipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, errPipe[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, outPipe[0]);
+    posix_spawn_file_actions_addclose(&actions, errPipe[0]);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attr, 0);
+
+    pid_t pid = -1;
+    const char *cmdArgs[] = {"/usr/bin/sudo", "/usr/bin/tlinkautob", "-e", [command UTF8String], NULL};
+    int spawnErr = posix_spawn(&pid, "/usr/bin/sudo", &actions, &attr, (char *const *)cmdArgs, NULL);
+
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+
+    close(outPipe[1]);
+    close(errPipe[1]);
+
+    if (spawnErr != 0) {
+        close(outPipe[0]);
+        close(errPipe[0]);
+        result.stderrStr = [NSString stringWithFormat:@"posix_spawn failed: %d", spawnErr];
+        return result;
+    }
+
+    TLinkShellDrainContext *drainCtx = [[TLinkShellDrainContext alloc] init];
+    __block BOOL forceCloseReaders = NO;
+
+    dispatch_queue_t ioQueue = dispatch_queue_create("com.tlinkauto.shell.io", DISPATCH_QUEUE_CONCURRENT);
+    dispatch_group_t drainGroup = dispatch_group_create();
+
+    void (^drainBlock)(int, BOOL) = ^(int fd, BOOL isStderr) {
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        while (true) {
+            if (forceCloseReaders) break;
+            struct pollfd pfd = { fd, POLLIN, 0 };
+            int ret = poll(&pfd, 1, 100);
+            if (ret > 0) {
+                if (pfd.revents & POLLIN) {
+                    uint8_t buf[kShellReadChunkBytes];
+                    ssize_t bytesRead = read(fd, buf, sizeof(buf));
+                    if (bytesRead > 0) {
+                        NSData *chunk = [NSData dataWithBytes:buf length:bytesRead];
+                        [drainCtx appendChunk:chunk toStderr:isStderr];
+                    } else if (bytesRead == 0) {
+                        break;
+                    }
+                } else if (pfd.revents & (POLLHUP | POLLERR)) {
+                    break;
+                }
+            } else if (ret < 0 && errno != EINTR) {
+                break;
+            }
+        }
+        close(fd);
+    };
+
+    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(outPipe[0], NO); });
+    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(errPipe[0], YES); });
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:actualTimeout];
+    BOOL timedOut = NO;
+    BOOL cancelled = NO;
+
+    while (true) {
+        int status;
+        pid_t wpid = waitpid(pid, &status, WNOHANG);
+        if (wpid == pid) {
+            if (WIFEXITED(status)) {
+                result.exitCode = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                result.exitCode = -1;
+                result.terminationSignal = WTERMSIG(status);
+            }
+            break;
+        }
+
+        if ([[NSDate date] compare:deadline] != NSOrderedAscending) {
+            timedOut = YES;
+            break;
+        }
+        if (context && context.cancellationToken && [context.cancellationToken isCancelled]) {
+            cancelled = YES;
+            break;
+        }
+        usleep(20 * 1000);
+    }
+
+    if (timedOut || cancelled) {
+        result.timedOut = timedOut;
+        result.cancelled = cancelled;
+        kill(-pid, SIGTERM);
+        
+        NSDate *graceDeadline = [NSDate dateWithTimeIntervalSinceNow:kShellTerminateGrace];
+        while (true) {
+            int status;
+            pid_t wpid = waitpid(pid, &status, WNOHANG);
+            if (wpid == pid) {
+                if (WIFEXITED(status)) result.exitCode = WEXITSTATUS(status);
+                else if (WIFSIGNALED(status)) { result.exitCode = -1; result.terminationSignal = WTERMSIG(status); }
+                break;
+            }
+            if ([[NSDate date] compare:graceDeadline] != NSOrderedAscending) {
+                kill(-pid, SIGKILL);
+                break;
+            }
+            usleep(20 * 1000);
+        }
+        
+        if (result.exitCode == -1 && result.terminationSignal == 0) {
+            int status;
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status)) result.exitCode = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status)) { result.exitCode = -1; result.terminationSignal = WTERMSIG(status); }
+        }
+
+        NSDate *drainDeadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while (dispatch_group_wait(drainGroup, DISPATCH_TIME_NOW) != 0) {
+            if ([[NSDate date] compare:drainDeadline] != NSOrderedAscending) {
+                forceCloseReaders = YES;
+                result.drainForcedClosed = YES;
+                break;
+            }
+            usleep(20 * 1000);
+        }
+    }
+
+    dispatch_group_wait(drainGroup, DISPATCH_TIME_FOREVER);
+
+    NSString *outStr = [[NSString alloc] initWithData:drainCtx.outData encoding:NSUTF8StringEncoding];
+    if (!outStr && drainCtx.outData.length > 0) outStr = [[NSString alloc] initWithData:drainCtx.outData encoding:NSASCIIStringEncoding];
+    
+    NSString *errStr = [[NSString alloc] initWithData:drainCtx.errData encoding:NSUTF8StringEncoding];
+    if (!errStr && drainCtx.errData.length > 0) errStr = [[NSString alloc] initWithData:drainCtx.errData encoding:NSASCIIStringEncoding];
+
+    result.stdoutStr = outStr ?: @"";
+    result.stderrStr = errStr ?: @"";
+    result.stdoutTruncated = drainCtx.outTruncated;
+    result.stderrTruncated = drainCtx.errTruncated;
+
+    return result;
+}
+
+void processTaskLegacy(UInt8 *buff, CFWriteStreamRef writeStreamRef)
+{
+    processTaskWithContext(buff, SIZE_MAX, writeStreamRef, nil);
+}
+
+void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
+{
+    processTaskLegacy(buff, writeStreamRef);
 }
 
 /**
 Process Task
 */
-void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
+void processTaskWithContext(UInt8 *buff, size_t actualLength, CFWriteStreamRef writeStreamRef, TLinkTaskExecutionContext *context)
 {
+    if (!buff) return;
+    
     //NSLog(@"### com.tlinkauto.springboard: task type: %d. Data: %s", getTaskType(buff), buff);
     UInt8 *eventData = buff + 0x2;
     int taskType = getTaskType(buff);
+
 
     //for touching
     if (taskType == TASK_PERFORM_TOUCH)
@@ -380,8 +571,6 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
     else if (taskType == TASK_RUN_SHELL)
     {
         @autoreleasepool{
-            // Payload format: command  OR  timeoutSeconds;;command
-            // (the bridge may prefix an optional timeout; if absent, default applies)
             NSString *rawPayload = [NSString stringWithUTF8String:(const char *)eventData] ?: @"";
             double timeout = kShellDefaultTimeout;
             NSString *command = rawPayload;
@@ -395,104 +584,67 @@ void processTask(UInt8 *buff, CFWriteStreamRef writeStreamRef)
                     command = [rawPayload substringFromIndex:sepRange.location + 2];
                 }
             }
-            // Clamp timeout to a safe range. 0/infinite is intentionally disallowed.
-            if (timeout < kShellMinTimeout) timeout = kShellMinTimeout;
-            if (timeout > kShellMaxTimeout) timeout = kShellMaxTimeout;
-
-            NSTask *task = [[NSTask alloc] init];
-            [task setLaunchPath:@"/usr/bin/sudo"];
-            [task setArguments:@[@"/usr/bin/tlinkautob", @"-e", command]];
-
-            // Separate pipes so each stream can be drained independently.
-            NSPipe *outPipe = [NSPipe pipe];
-            NSPipe *errPipe = [NSPipe pipe];
-            [task setStandardOutput:outPipe];
-            [task setStandardError:errPipe];
-            NSFileHandle *outHandle = [outPipe fileHandleForReading];
-            NSFileHandle *errHandle = [errPipe fileHandleForReading];
-
-            NSMutableData *outData = [NSMutableData data];
-            NSMutableData *errData = [NSMutableData data];
-            __block bool outTruncated = false;
-            __block bool errTruncated = false;
-            ZXShellBudget budget;
-            budget.lock = OS_UNFAIR_LOCK_INIT;
-            budget.capturedBytes = 0;
-            ZXShellBudget *budgetPtr = &budget;
-
-            dispatch_queue_t ioQueue = dispatch_queue_create("com.tlinkauto.shell.io", DISPATCH_QUEUE_CONCURRENT);
-            dispatch_group_t drainGroup = dispatch_group_create();
-
-            // A1: start readers BEFORE launch so the pipe is always being drained.
-            // Capture budgetPtr (a pointer) rather than the struct: blocks capture
-            // automatic variables as const-by-value, which would make &budget a
-            // const pointer. budget lives on the stack until dispatch_group_wait below.
-            dispatch_group_async(drainGroup, ioQueue, ^{
-                ZXDrainShellHandle(outHandle, outData, budgetPtr, &outTruncated);
-            });
-            dispatch_group_async(drainGroup, ioQueue, ^{
-                ZXDrainShellHandle(errHandle, errData, budgetPtr, &errTruncated);
-            });
-
-            bool launched = false;
-            @try {
-                [task launch];
-                launched = true;
-            } @catch (NSException *e) {
-                NSLog(@"com.tlinkauto.springboard: runShell launch failed: %@", e.reason);
-            }
-
-            bool timedOut = false;
-            if (launched) {
-                // A4: bounded wait instead of waitUntilExit. Poll termination with a deadline.
-                NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-                while ([task isRunning]) {
-                    if ([[NSDate date] compare:deadline] != NSOrderedAscending) {
-                        timedOut = true;
-                        break;
-                    }
-                    usleep(20 * 1000); // 20 ms poll
-                }
-
-                if (timedOut) {
-                    // A5: SIGTERM -> grace -> SIGKILL.
-                    pid_t pid = [task processIdentifier];
-                    if (pid > 0) kill(pid, SIGTERM);
-                    NSDate *graceDeadline = [NSDate dateWithTimeIntervalSinceNow:kShellTerminateGrace];
-                    while ([task isRunning] && [[NSDate date] compare:graceDeadline] == NSOrderedAscending) {
-                        usleep(20 * 1000);
-                    }
-                    if ([task isRunning] && pid > 0) {
-                        kill(pid, SIGKILL);
-                    }
-                }
-            }
-
-            // Close write ends / handles so readers hit EOF, then wait for drain with a bounded deadline.
-            @try { [outHandle closeFile]; } @catch (NSException *e) {}
-            @try { [errHandle closeFile]; } @catch (NSException *e) {}
-            dispatch_group_wait(drainGroup, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
-
-            int status = (launched && !timedOut) ? [task terminationStatus] : -1;
-
-            NSString *outStr = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding] ?: @"";
-            NSString *errStr = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
-            NSString *combined = errStr.length > 0 ? [outStr stringByAppendingString:errStr] : outStr;
+            
+            TLinkShellResult *result = RunShellCore(command, context, timeout, SIZE_MAX);
+            
+            NSString *combined = result.stderrStr.length > 0 ? [result.stdoutStr stringByAppendingString:result.stderrStr] : result.stdoutStr;
             NSString *safeOutput = [[combined stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"] stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
-            bool truncated = outTruncated || errTruncated;
-            if (truncated) {
+            if (result.stdoutTruncated || result.stderrTruncated) {
                 safeOutput = [safeOutput stringByAppendingFormat:@"\\n[output truncated: exceeded %lu bytes]", (unsigned long)kShellMaxCapturedOutputBytes];
             }
-
-            if (timedOut) {
+            
+            if (result.timedOut) {
                 notifyClient((UInt8*)[[NSString stringWithFormat:@"-1;;Shell command timed out after %.0fs: %@\r\n", timeout, safeOutput] UTF8String], writeStreamRef);
-            } else if (!launched) {
-                notifyClient((UInt8*)[[NSString stringWithFormat:@"-1;;Shell command failed to launch\r\n"] UTF8String], writeStreamRef);
-            } else if (status == 0) {
+            } else if (result.cancelled) {
+                notifyClient((UInt8*)[[NSString stringWithFormat:@"-1;;Shell command cancelled: %@\r\n", safeOutput] UTF8String], writeStreamRef);
+            } else if (result.exitCode == 0) {
                 notifyClient((UInt8*)[[NSString stringWithFormat:@"0;;%@\r\n", safeOutput] UTF8String], writeStreamRef);
             } else {
-                notifyClient((UInt8*)[[NSString stringWithFormat:@"-1;;Shell command failed (%d): %@\r\n", status, safeOutput] UTF8String], writeStreamRef);
+                notifyClient((UInt8*)[[NSString stringWithFormat:@"-1;;Shell command failed (%d): %@\r\n", result.exitCode, safeOutput] UTF8String], writeStreamRef);
             }
+        }
+    }
+    else if (taskType == TASK_RUN_SHELL_V2)
+    {
+        @autoreleasepool{
+            NSError *jsonErr = nil;
+            NSData *payloadData = [NSData dataWithBytes:eventData length:actualLength - 2];
+            NSDictionary *req = [NSJSONSerialization JSONObjectWithData:payloadData options:0 error:&jsonErr];
+            
+            NSString *command = @"";
+            double timeout = kShellDefaultTimeout;
+            NSUInteger maxOutput = kTLinkautoJSMaxResponseBytes;
+            
+            if (!jsonErr && [req isKindOfClass:[NSDictionary class]]) {
+                command = req[@"command"] ?: @"";
+                if (req[@"timeoutSeconds"]) timeout = [req[@"timeoutSeconds"] doubleValue];
+                if (req[@"maxOutputBytes"]) maxOutput = [req[@"maxOutputBytes"] unsignedIntegerValue];
+            }
+            
+            TLinkShellResult *result = RunShellCore(command, context, timeout, maxOutput);
+            
+            NSMutableDictionary *resp = [NSMutableDictionary dictionary];
+            resp[@"exitCode"] = result.exitCode == -1 ? [NSNull null] : @(result.exitCode);
+            resp[@"terminationSignal"] = @(result.terminationSignal);
+            resp[@"timedOut"] = @(result.timedOut);
+            resp[@"cancelled"] = @(result.cancelled);
+            resp[@"drainForcedClosed"] = @(result.drainForcedClosed);
+            resp[@"stdout"] = result.stdoutStr;
+            resp[@"stderr"] = result.stderrStr;
+            resp[@"stdoutTruncated"] = @(result.stdoutTruncated);
+            resp[@"stderrTruncated"] = @(result.stderrTruncated);
+            
+            NSData *respData = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+            if (respData.length > kTLinkautoJSMaxResponseBytes) {
+                resp[@"stdout"] = @"[Truncated due to JSON size limit]";
+                resp[@"stderr"] = @"[Truncated due to JSON size limit]";
+                resp[@"stdoutTruncated"] = @(YES);
+                resp[@"stderrTruncated"] = @(YES);
+                respData = [NSJSONSerialization dataWithJSONObject:resp options:0 error:nil];
+            }
+            
+            NSString *respJson = [[NSString alloc] initWithData:respData encoding:NSUTF8StringEncoding];
+            notifyClient((UInt8*)[[NSString stringWithFormat:@"0;;%@\r\n", respJson] UTF8String], writeStreamRef);
         }
     }
     else if (taskType == TASK_TOUCH_RECORDING_START)

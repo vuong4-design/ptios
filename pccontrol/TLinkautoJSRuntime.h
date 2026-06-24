@@ -8,8 +8,11 @@
 @property(nonatomic, readonly) BOOL running;
 @property(nonatomic, readonly) NSString *runId;
 
-- (BOOL)runScriptAtPath:(NSString *)scriptPath bundlePath:(NSString *)bundlePath manifest:(NSDictionary *)manifest error:(NSError **)error;
+@class TLinkTaskExecutionContext;
+
+- (BOOL)runScriptAtPath:(NSString *)scriptPath bundlePath:(NSString *)bundlePath manifest:(NSDictionary *)manifest context:(TLinkTaskExecutionContext *)context error:(NSError **)error;
 - (void)requestStop;
+- (BOOL)isAborted;
 
 @end
 
