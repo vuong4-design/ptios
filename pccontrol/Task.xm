@@ -1,4 +1,7 @@
 #include "Task.h"
+#import <Foundation/Foundation.h>
+#include <spawn.h>
+#include <poll.h>
 #include "Touch.h"
 #include "Process.h"
 #include "AlertBox.h"
@@ -344,8 +347,10 @@ static TLinkShellResult *RunShellCore(NSString *command, TLinkTaskExecutionConte
         close(fd);
     };
 
-    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(outPipe[0], NO); });
-    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(errPipe[0], YES); });
+    int outFd = outPipe[0];
+    int errFd = errPipe[0];
+    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(outFd, NO); });
+    dispatch_group_async(drainGroup, ioQueue, ^{ drainBlock(errFd, YES); });
 
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:actualTimeout];
     BOOL timedOut = NO;
