@@ -1,4 +1,5 @@
 #import "TLinkautoJSRuntime.h"
+#import <os/lock.h>
 
 #import <UIKit/UIKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
@@ -519,10 +520,8 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
         _watchdogAvailable = TLinkautoJSWatchdogCapability(_setExecutionTimeLimit, _clearExecutionTimeLimit);
         
         _logQueue = dispatch_queue_create("com.tlinkauto.js.log", DISPATCH_QUEUE_SERIAL);
-        _logStateLock = OS_UNFAIR_LOCK_INIT;
         _acceptingLogs = NO;
         
-        _handlesLock = OS_UNFAIR_LOCK_INIT;
         _acceptingHandles = NO;
     }
     return self;
