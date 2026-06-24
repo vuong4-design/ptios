@@ -142,9 +142,7 @@ static NSString *tlinkautoStringValue(id value) {
         return -1;
     }
     NSDictionary *scriptInfo = [NSDictionary dictionaryWithContentsOfFile:infoFilePath];
-    JS_DIAG("T3A", "before manifest read");
     NSDictionary *manifest = tlinkautoReadManifest(scriptBundlePath);
-    JS_DIAG("T3B", "after manifest read, info/manifest populated");
     currentManifest = manifest ?: @{};
     
     NSString *entryFileName = tlinkautoStringValue(manifest[@"entry"]) ?: scriptInfo[@"Entry"];
@@ -180,9 +178,6 @@ static NSString *tlinkautoStringValue(id value) {
         }); 
         return 0;
     } else if ([runtime isEqualToString:@"javascriptcore"] || [fileExtension isEqualToString:@"js"]) {
-        CFAbsoluteTime requestAt = CFAbsoluteTimeGetCurrent();
-        JS_DIAG("P0", "play requested");
-        
         if (!tlinkautoJavaScriptRuntimeEnabled()) {
             if (error) *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;JavaScriptCore runtime is disabled.\r\n"}];
             [self clear];
@@ -195,13 +190,10 @@ static NSString *tlinkautoStringValue(id value) {
         }
         currentScriptType = 3;
         
-        JS_DIAG("LOCK-0", "before player lock main=%d", [NSThread isMainThread]);
         os_unfair_lock_lock(&_playerLock);
-        JS_DIAG("LOCK-1", "player lock acquired");
         
         if (_state != TLinkScriptStateIdle) {
             os_unfair_lock_unlock(&_playerLock);
-            JS_DIAG("LOCK-2", "player lock released (already running)");
             if (error) *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;Script is already running.\r\n"}];
             return -1;
         }
@@ -216,7 +208,6 @@ static NSString *tlinkautoStringValue(id value) {
         _currentSession = session;
         isPlaying = true;
         os_unfair_lock_unlock(&_playerLock);
-        JS_DIAG("LOCK-2", "player lock released (success)");
 
         dispatch_async(_jsSerialQueue, ^{
             [self executeJSIteration:session filePath:entryFilePath foregroundApp:foregroundApp requestAt:requestAt];
@@ -242,18 +233,14 @@ static NSString *tlinkautoStringValue(id value) {
 }
 
 - (int)play:(NSError**)error {
-    JS_DIAG("LOCK-0", "before player lock (play) main=%d", [NSThread isMainThread]);
     os_unfair_lock_lock(&_playerLock);
-    JS_DIAG("LOCK-1", "player lock acquired (play)");
     
     if (_state != TLinkScriptStateIdle || isPlaying) {
         os_unfair_lock_unlock(&_playerLock);
-        JS_DIAG("LOCK-2", "player lock released (play, already running)");
         *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;Unable to run the script. Another script is currently running.\r\n"}];
         return -1;
     }
     os_unfair_lock_unlock(&_playerLock);
-    JS_DIAG("LOCK-2", "player lock released (play, success)");
     return [self runScript:error];
 }
 
@@ -318,15 +305,12 @@ static NSString *tlinkautoStringValue(id value) {
 }
 
 - (void)executeJSIteration:(TLinkScriptSession *)session filePath:(NSString *)filePath foregroundApp:(NSString *)foregroundApp requestAt:(CFAbsoluteTime)requestAt {
-    JS_DIAG("P2", "entered js queue, wait=%.2fms", (CFAbsoluteTimeGetCurrent() - requestAt) * 1000.0);
-    
     os_unfair_lock_lock(&_playerLock);
     if (_currentSession != session || [session.cancellationToken isCancelled]) {
         os_unfair_lock_unlock(&_playerLock);
         return;
     }
     TLinkautoJSRuntime *runtime = [[TLinkautoJSRuntime alloc] init];
-    JS_DIAG("P4", "runtime allocated, total=%.2fms", (CFAbsoluteTimeGetCurrent() - requestAt) * 1000.0);
     _currentRuntime = runtime;
     _state = TLinkScriptStateRunning;
     os_unfair_lock_unlock(&_playerLock);
@@ -336,9 +320,7 @@ static NSString *tlinkautoStringValue(id value) {
     }
 
     NSError *runError = nil;
-    JS_DIAG("P5", "before runScriptAtPath");
     BOOL ok = [runtime runScriptAtPath:filePath bundlePath:scriptBundlePath manifest:currentManifest context:session.taskContext error:&runError];
-    JS_DIAG("P6", "runScript returned success=%d total=%.2fms", ok, (CFAbsoluteTimeGetCurrent() - requestAt) * 1000.0);
     
     os_unfair_lock_lock(&_playerLock);
     if (_currentSession != session) {

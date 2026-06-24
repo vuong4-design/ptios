@@ -6,57 +6,6 @@
 //
 
 #import "AppDelegate.h"
-#import "TLinkAppDiagnostic.h"
-
-@interface TLinkMainThreadWatchdog : NSObject
-@property(nonatomic, strong) dispatch_queue_t watchdogQueue;
-@property(nonatomic, assign) BOOL running;
-@end
-
-@implementation TLinkMainThreadWatchdog
-
-+ (instancetype)sharedInstance {
-    static TLinkMainThreadWatchdog *shared = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        shared = [[self alloc] init];
-    });
-    return shared;
-}
-
-- (void)start
-{
-    if (self.running) {
-        return;
-    }
-
-    self.running = true;
-
-    self.watchdogQueue = dispatch_queue_create(
-        "com.tlinkauto.main-watchdog",
-        DISPATCH_QUEUE_SERIAL
-    );
-
-    dispatch_async(self.watchdogQueue, ^{
-        while (self.running) {
-            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-            CFAbsoluteTime sentAt = CFAbsoluteTimeGetCurrent();
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                CFAbsoluteTime delay = CFAbsoluteTimeGetCurrent() - sentAt;
-                if (delay > 0.1) {
-                    APP_DIAG("MAIN-STALL", "main queue delay=%.2fms", delay * 1000.0);
-                }
-                dispatch_semaphore_signal(semaphore);
-            });
-
-            dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
-            usleep(100 * 1000);
-        }
-    });
-}
-
-@end
 
 @interface AppDelegate ()
 {
@@ -69,7 +18,6 @@
 
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    [[TLinkMainThreadWatchdog sharedInstance] start];
     // Override point for customization after application launch.
 
     if (@available(iOS 13.0, *)) {

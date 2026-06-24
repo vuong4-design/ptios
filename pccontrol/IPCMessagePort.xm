@@ -48,14 +48,11 @@ static CFDataRef handleIPCMessage(CFMessagePortRef local, SInt32 msgid, CFDataRe
         if ([rawTask length] > 0) {
             CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
             NSLog(@"### com.tlinkauto.springboard: IPC task start: %@", rawTask);
-            JS_DIAG("S0", "socket packet complete length=%zu", (size_t)[rawTask length]);
             CFWriteStreamRef responseStream = CFWriteStreamCreateWithAllocatedBuffers(kCFAllocatorDefault,
                                                                                       kCFAllocatorDefault);
             if (responseStream) {
                 CFWriteStreamOpen(responseStream);
-                JS_DIAG("S1", "before processTask");
                 processTask((UInt8 *)[rawTask UTF8String], responseStream);
-                JS_DIAG("S2", "after processTask");
                 CFTypeRef responseProperty = CFWriteStreamCopyProperty(responseStream, kCFStreamPropertyDataWritten);
                 CFWriteStreamClose(responseStream);
                 CFRelease(responseStream);

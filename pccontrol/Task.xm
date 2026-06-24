@@ -476,8 +476,6 @@ void processTaskWithContext(UInt8 *buff, size_t actualLength, CFWriteStreamRef w
     //NSLog(@"### com.tlinkauto.springboard: task type: %d. Data: %s", getTaskType(buff), buff);
     UInt8 *eventData = buff + 0x2;
     int taskType = getTaskType(buff);
-    JS_DIAG("T0", "processTask enter type=%d length=%zu", taskType, actualLength);
-
 
     //for touching
     if (taskType == TASK_PERFORM_TOUCH)
@@ -699,12 +697,8 @@ void processTaskWithContext(UInt8 *buff, size_t actualLength, CFWriteStreamRef w
     else if (taskType == TASK_PLAY_SCRIPT)
     {
         @autoreleasepool {
-            JS_DIAG("T1", "entered JS play task");
-            JS_DIAG("T2", "payload parsed path=%s", (char *)eventData ?: "(null)");
             NSError *err = nil;
-            JS_DIAG("T4", "before calling ScriptPlayer/playScript");
             playScript((UInt8*)eventData, &err);
-            JS_DIAG("T5", "playScript returned");
             if (err)
             {
                 setLastScriptError([err localizedDescription]);

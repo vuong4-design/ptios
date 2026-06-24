@@ -882,8 +882,6 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
 - (BOOL)runScriptAtPath:(NSString *)scriptPath bundlePath:(NSString *)bundlePath manifest:(NSDictionary *)manifest context:(TLinkTaskExecutionContext *)context error:(NSError **)error
 {
     CFAbsoluteTime runtimeStart = CFAbsoluteTimeGetCurrent();
-    #define RUNTIME_DIAG(checkpoint, message) JS_DIAG(checkpoint, "%s elapsed=%.2fms", message, (CFAbsoluteTimeGetCurrent() - runtimeStart) * 1000.0)
-    RUNTIME_DIAG("R0", "enter runScriptAtPath");
 
     if (_running) {
         if (error) *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;JavaScript runtime is busy.\r\n"}];
@@ -900,8 +898,6 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     _bundlePath = [bundlePath copy];
     _manifest = [manifest isKindOfClass:[NSDictionary class]] ? [manifest copy] : @{};
     [self prepareConsoleLogFiles];
-    RUNTIME_DIAG("R1", "openLog finished");
-    
     os_unfair_lock_lock(&_logStateLock);
     _acceptingLogs = YES;
     os_unfair_lock_unlock(&_logStateLock);
@@ -914,14 +910,9 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     
     @try {
 
-    NSLog(@"[Diag-E1] Init JSVM start");
     JSVirtualMachine *vm = [[JSVirtualMachine alloc] init];
-    RUNTIME_DIAG("R2", "JSVirtualMachine created");
-    NSLog(@"[Diag-E2] Init JSVM done, Init JSContext start");
     JSContext *context = [[JSContext alloc] initWithVirtualMachine:vm];
-    RUNTIME_DIAG("R3", "JSContext created");
     _context = context;
-    NSLog(@"[Diag-E3] Init JSContext done");
 
     __weak TLinkautoJSRuntime *weakSelf = self;
     context.exceptionHandler = ^(JSContext *ctx, JSValue *exception) {
@@ -1107,13 +1098,8 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     [context evaluateScript:consolePrelude withSourceURL:[NSURL URLWithString:@"tlinkauto://console-prelude.js"]];
     [context evaluateScript:modulePrelude withSourceURL:[NSURL URLWithString:@"tlinkauto://module-prelude.js"]];
     [context evaluateScript:helperPrelude withSourceURL:[NSURL URLWithString:@"tlinkauto://helper-prelude.js"]];
-    RUNTIME_DIAG("R6", "bootstrap evaluated");
     NSURL *sourceURL = [NSURL fileURLWithPath:scriptPath ?: @"script.js"];
-    NSLog(@"[Diag-E5] Evaluating main script");
-    RUNTIME_DIAG("R7", "before user evaluate");
     [context evaluateScript:script withSourceURL:sourceURL];
-    RUNTIME_DIAG("R8", "after user evaluate");
-    NSLog(@"[Diag-E6] Script evaluation finished");
     BOOL success = !context.exception && ![self isAborted];
     if (!success && error) {
         NSString *message = context.exception ? [context.exception toString] : @"JavaScript execution was stopped";
@@ -1121,7 +1107,6 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     }
     return success;
     } @finally {
-        NSLog(@"[Diag-E8] Teardown start");
         [self releaseOwnedHandles];
         [self clearWatchdogForContext:_context];
         _context = nil;
