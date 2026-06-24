@@ -109,7 +109,7 @@ JSExportAs(keepAwake,
 JSExportAs(touchIndicator,
 - (NSDictionary *)touchIndicator:(NSString *)action);
 JSExportAs(runShell,
-- (NSDictionary *)runShell:(NSString *)command);
+- (NSDictionary *)runShell:(NSString *)command timeoutSeconds:(double)timeoutSeconds);
 JSExportAs(saveScreenshotToAlbum,
 - (NSDictionary *)saveScreenshotToAlbum:(NSString *)path);
 JSExportAs(matchTemplate,
@@ -1915,13 +1915,20 @@ static NSDictionary *TLinkautoJSOCRResultByAddingDecodedError(NSDictionary *resu
     return [self pathTask:TASK_BOT_PATH key:@"botPath"];
 }
 
-- (NSDictionary *)runShell:(NSString *)command
+- (NSDictionary *)runShell:(NSString *)command timeoutSeconds:(double)timeoutSeconds
 {
     if (!TLinkautoJSValidProtocolString(command)) {
         [self.runtime throwError:@"runShell(command) requires a non-empty single-line command"];
         return @{ @"ok": @NO };
     }
-    NSDictionary *result = [self runTask:TASK_RUN_SHELL payload:command];
+    // Optional timeout: prepend "timeout;;" only when a finite positive value is given.
+    // The command itself can never contain ";;" (rejected above), so the first ";;"
+    // is unambiguously the separator parsed by the Task.xm handler.
+    NSString *payload = command;
+    if (TLinkautoJSIsFiniteNumber(timeoutSeconds) && timeoutSeconds > 0) {
+        payload = [NSString stringWithFormat:@"%.3f;;%@", timeoutSeconds, command];
+    }
+    NSDictionary *result = [self runTask:TASK_RUN_SHELL payload:payload];
     NSArray *parts = result[@"parts"];
     if (![result[@"ok"] boolValue] || [parts count] < 2) return result;
     NSArray *outputParts = [parts subarrayWithRange:NSMakeRange(1, [parts count] - 1)];
