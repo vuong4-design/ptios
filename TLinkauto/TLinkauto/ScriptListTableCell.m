@@ -8,6 +8,7 @@
 #import "ScriptListTableCell.h"
 #import "Socket.h"
 #import "Util.h"
+#import "TLinkAppDiagnostic.h"
 
 @implementation ScriptListTableCell
 {
@@ -20,16 +21,28 @@
 }
 
 - (IBAction)playButtonClick:(id)sender {
-    Socket *springBoardSocket = [[Socket alloc] init];
-    [springBoardSocket connect:@"127.0.0.1" byPort:6000];
+    APP_DIAG("A0", "play button tapped path=%s", filePath.UTF8String ?: "(null)");
     
-    [springBoardSocket send:[NSString stringWithFormat:@"19%@", filePath]];
+    Socket *springBoardSocket = [[Socket alloc] init];
+    APP_DIAG("C0", "before socket connect 127.0.0.1:6000");
+    [springBoardSocket connect:@"127.0.0.1" byPort:6000];
+    APP_DIAG("C1", "socket connected");
+    
+    NSString *payload = [NSString stringWithFormat:@"19%@", filePath];
+    APP_DIAG("A4", "before socket write type=19 len=%lu", (unsigned long)payload.length);
+    [springBoardSocket send:payload];
+    APP_DIAG("A5", "socket write done");
+    
+    APP_DIAG("A5B", "before recv (blocking)");
     NSString* result = [springBoardSocket recv:1024];
+    APP_DIAG("A6", "recv returned len=%lu result=%.40s", (unsigned long)result.length, result.UTF8String ?: "(null)");
+    
     if ([result characterAtIndex:0] != '0')
     {
         [Util showAlertBoxWithOneOption:_parentViewController title:@"Error" message:[NSString stringWithFormat:@"Cannot play script. Error: %@", result] buttonString:@"OK"];
     }
     [springBoardSocket close];
+    APP_DIAG("A7", "socket closed, play flow complete");
 }
 
 - (void)setSelected:(BOOL)selected animated:(BOOL)animated {
