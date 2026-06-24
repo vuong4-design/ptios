@@ -142,7 +142,9 @@ static NSString *tlinkautoStringValue(id value) {
         return -1;
     }
     NSDictionary *scriptInfo = [NSDictionary dictionaryWithContentsOfFile:infoFilePath];
+    JS_DIAG("T3A", "before manifest read");
     NSDictionary *manifest = tlinkautoReadManifest(scriptBundlePath);
+    JS_DIAG("T3B", "after manifest read, info/manifest populated");
     currentManifest = manifest ?: @{};
     
     NSString *entryFileName = tlinkautoStringValue(manifest[@"entry"]) ?: scriptInfo[@"Entry"];
