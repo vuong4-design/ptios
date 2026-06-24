@@ -66,8 +66,11 @@
         [springBoardSocket close];
         APP_DIAG("A7", "socket closed, play flow complete");
         
+        APP_DIAG("UI-R0", "before enqueue result block");
         dispatch_async(dispatch_get_main_queue(), ^{
+            APP_DIAG("UI-R1", "entered result block");
             self->_playButton.enabled = YES;
+            APP_DIAG("UI-R2", "button re-enabled");
             if (result.length > 0 && [result characterAtIndex:0] != '0') {
                 UIViewController *parent = weakParent;
                 if (parent) {

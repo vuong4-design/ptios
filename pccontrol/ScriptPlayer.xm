@@ -195,9 +195,13 @@ static NSString *tlinkautoStringValue(id value) {
         }
         currentScriptType = 3;
         
+        JS_DIAG("LOCK-0", "before player lock main=%d", [NSThread isMainThread]);
         os_unfair_lock_lock(&_playerLock);
+        JS_DIAG("LOCK-1", "player lock acquired");
+        
         if (_state != TLinkScriptStateIdle) {
             os_unfair_lock_unlock(&_playerLock);
+            JS_DIAG("LOCK-2", "player lock released (already running)");
             if (error) *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;Script is already running.\r\n"}];
             return -1;
         }
@@ -212,6 +216,7 @@ static NSString *tlinkautoStringValue(id value) {
         _currentSession = session;
         isPlaying = true;
         os_unfair_lock_unlock(&_playerLock);
+        JS_DIAG("LOCK-2", "player lock released (success)");
 
         dispatch_async(_jsSerialQueue, ^{
             [self executeJSIteration:session filePath:entryFilePath foregroundApp:foregroundApp requestAt:requestAt];
@@ -237,13 +242,18 @@ static NSString *tlinkautoStringValue(id value) {
 }
 
 - (int)play:(NSError**)error {
+    JS_DIAG("LOCK-0", "before player lock (play) main=%d", [NSThread isMainThread]);
     os_unfair_lock_lock(&_playerLock);
+    JS_DIAG("LOCK-1", "player lock acquired (play)");
+    
     if (_state != TLinkScriptStateIdle || isPlaying) {
         os_unfair_lock_unlock(&_playerLock);
+        JS_DIAG("LOCK-2", "player lock released (play, already running)");
         *error = [NSError errorWithDomain:@"com.tlinkauto.tlinkautosp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;Unable to run the script. Another script is currently running.\r\n"}];
         return -1;
     }
     os_unfair_lock_unlock(&_playerLock);
+    JS_DIAG("LOCK-2", "player lock released (play, success)");
     return [self runScript:error];
 }
 
